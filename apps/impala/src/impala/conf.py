@@ -199,8 +199,6 @@ DAEMON_API_USERNAME = Config(
   private=True,
   default=None)
 
-
-
 def config_validator(user):
   # dbms is dependent on beeswax.conf (this file)
   # import in method to avoid circular dependency

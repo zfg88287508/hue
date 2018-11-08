@@ -17,13 +17,21 @@
 
 ## Main views are inherited from Beeswax.
 
+import base64
 import logging
 import json
+import struct
+import tempfile
+import os
 
 from django.utils.translation import ugettext as _
 from django.views.decorators.http import require_POST
 
 from desktop.lib.django_util import JsonResponse
+from desktop.lib.exceptions_renderable import PopupException
+from desktop.lib.rest import http_client, resource
+from desktop.lib.rest.http_client import RestException
+from desktop.models import Document2
 
 from beeswax.api import error_handler
 from beeswax.server.dbms import get_cluster_config
@@ -32,9 +40,16 @@ from beeswax.server import dbms as beeswax_dbms
 from beeswax.views import authorized_get_query_history
 
 from impala import dbms
+from impala.dbms import _get_server_name
+from impala.server import get_api as get_impalad_api, ImpalaDaemonApiException, _get_impala_server_url
 
+from lxml import html
+
+from libanalyze import analyze as analyzer
+from libanalyze import rules
 
 LOG = logging.getLogger(__name__)
+ANALYZER = rules.TopDownAnalysis() # We need to parse some files so save as global
 
 @require_POST
 @error_handler
@@ -111,4 +126,34 @@ def get_runtime_profile(request, query_history_id):
     response['status'] = 0
     response['profile'] = profile
 
+  return JsonResponse(response)
+
+@require_POST
+@error_handler
+def alanize(request):
+  response = {'status': -1}
+  cluster = json.loads(request.POST.get('cluster', '{}'))
+  query_id = json.loads(request.POST.get('query_id'))
+  application = _get_server_name(cluster)
+  query_server = dbms.get_query_server_config()
+  session = Session.objects.get_session(request.user, query_server['server_name'])
+  server_url = _get_impala_server_url(session)
+  if query_id:
+    LOG.debug("Attempting to get Impala query profile at server_url %s for query ID: %s" % (server_url, query_id))
+    doc = Document2.objects.get(id=query_id)
+    snippets = doc.data_dict.get('snippets', [])
+    secret = snippets[0]['result']['handle']['secret']
+    api = get_impalad_api(user=request.user, url=server_url)
+    impala_query_id = "%x:%x" % struct.unpack(b"QQ", base64.decodestring(secret))
+    api.kill(impala_query_id) # There seems to be a bug where ExecSummary is not present in profile if query is opened. We could fetch it from query_summary, but just close query for demo purpose
+    query_profile = api.get_query_profile_encoded(impala_query_id)
+    profile = analyzer.analyze(analyzer.parse_data(query_profile))
+    result = ANALYZER.run(profile)
+    heatmap = {}
+    summary = analyzer.summary(profile)
+    heatmapMetrics = ['AverageThreadTokens', 'BloomFilterBytes', 'PeakMemoryUsage', 'PerHostPeakMemUsage', 'PrepareTime', 'RowsProduced', 'TotalCpuTime', 'TotalNetworkReceiveTime', 'TotalNetworkSendTime', 'TotalStorageWaitTime', 'TotalTime']
+    for key in heatmapMetrics:
+      heatmap[key] = analyzer.heatmap_by_host(profile, key)
+    response['data'] = { 'query': { 'healthChecks' : result[0]['result'], 'summary': summary, 'heatmap': heatmap, 'heatmapMetrics': heatmapMetrics } }
+    response['status'] = 0
   return JsonResponse(response)
